@@ -1,0 +1,120 @@
+# 생성 리소스: GitHub Actions 워크플로우 (validate / plan / apply 3개 Job)
+name: Terraform CI/CD
+
+# 트리거 조건
+on:
+  pull_request:
+    branches: [main] # main 대상 PR에서 동작
+    paths: # 아래 경로 변경 시에만 실행 (불필요한 실행 방지)
+      - "terraform/**"
+      - ".github/workflows/terraform.yml"
+  push:
+    branches: [main] # main 머지 시 apply 실행
+    paths:
+      - "terraform/**"
+
+# 전역 환경변수
+env:
+  TF_VERSION: "1.15.2" # Terraform 버전 고정 (재현성 확보)
+  AWS_REGION: "ap-northeast-2" # 서울 리전
+  TF_WORKING_DIR: "./terraform/eks-infra" # Terraform 작업 디렉터리
+
+# ── 권한 설정 (OIDC 인증용) ─────────────────────────────
+permissions:
+  id-token: write # AWS OIDC 토큰 발급 권한 (IAM Role 가정용)
+  contents: read # 코드 체크아웃 권한
+  pull-requests: write # PR 코멘트 작성 권한
+
+jobs:
+  # Job 1. Validate ── 코드 검증 (포맷/문법)
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ env.TF_WORKING_DIR }}
+    steps:
+      - uses: actions/checkout@v4 # 저장소 코드 체크아웃
+      - uses: hashicorp/setup-terraform@v3 # Terraform CLI 설치
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - uses: aws-actions/configure-aws-credentials@v4 # OIDC로 AWS 인증 (Access Key 미사용)
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-terraform-role
+          aws-region: ${{ env.AWS_REGION }}
+      - run: terraform init # provider/모듈 다운로드, backend 초기화
+      - run: terraform fmt -check -recursive # 포맷 검사 (자동 수정 X, 위반 시 실패)
+      - run: terraform validate # HCL 문법 및 구성 유효성 검증
+
+  # Job 2. Plan ── 변경사항 미리보기 + PR 코멘트
+  plan:
+    name: Plan
+    needs: validate # validate 성공 시에만 실행
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ env.TF_WORKING_DIR }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-terraform-role
+          aws-region: ${{ env.AWS_REGION }}
+      - run: terraform init
+
+      - name: Terraform Plan # plan 결과를 tfplan(바이너리)와 텍스트 동시 저장
+        run: terraform plan -no-color -out=tfplan 2>&1 | tee plan-output.txt
+
+      - name: PR 코멘트 게시 # PR에 plan 결과 자동 댓글 (리뷰어 검토용)
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('./terraform/eks-infra/plan-output.txt', 'utf8');
+            // GitHub 코멘트 65,536자 제한 회피용 truncate
+            const body = plan.length > 65000 ? plan.substring(0, 65000) + '\n...(생략)' : plan;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## Terraform Plan\n\`\`\`\n${body}\n\`\`\``
+            });
+
+      - uses: actions/upload-artifact@v4 # tfplan 파일을 apply Job으로 전달 (1일 보관)
+        with:
+          name: tfplan
+          path: ./terraform/eks-infra/tfplan
+          retention-days: 1
+
+  # Job 3. Apply ── 실제 인프라 반영 (main push 시에만)
+  apply:
+    name: Apply
+    needs: plan # plan 성공 시에만 실행
+    runs-on: ubuntu-latest
+    # PR에서는 실행 X, main 브랜치 push에서만 실행 (안전장치)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: production # GitHub Environment의 수동 승인 게이트 통과 필요
+    defaults:
+      run:
+        working-directory: ${{ env.TF_WORKING_DIR }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-terraform-role
+          aws-region: ${{ env.AWS_REGION }}
+      - run: terraform init
+
+      - uses: actions/download-artifact@v4 # plan Job에서 저장한 tfplan 파일 가져옴
+        with:
+          name: tfplan
+          path: ./terraform/eks-infra
+
+      - run: terraform apply -auto-approve tfplan # tfplan에 기록된 변경만 정확히 적용 (drift 방지)
