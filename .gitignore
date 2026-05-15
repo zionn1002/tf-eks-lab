@@ -1,0 +1,14 @@
+# Terraform
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+.terraform.lock.hcl
+
+# 환경별 변수 파일 (민감 정보 포함 가능)
+*.tfvars
+*.tfvars.json
+
+# macOS
+.DS_Store
